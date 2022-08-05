@@ -123,11 +123,15 @@ fn callback(store: SCDynamicStore, changed_keys: CFArray<CFString>, context: &mu
                 set_wifi_state(&name, !active);
                 context.active_wifis.remove(&name);
             } else if context.ethernets.contains(&name) && active {
-                println!("new active ethernet link, disabling all wifi links");
+                println!("saw activated ethernet link, disabling all wifi links");
                 for w in context.wifis.iter() {
                     println!("disabling wifi interface: name=\"{}\"", w);
                     set_wifi_state(&w, false);
                 }
+            } else if !context.wifis.contains(&name) && !context.ethernets.contains(&name) && !active {
+                // Assume it's a new Ethernet link being plugged in, add it
+                println!("new inactive ethernet link, adding to list");
+                context.ethernets.insert(name);
             }
         } else {
             println!("removed link: {}", name);
