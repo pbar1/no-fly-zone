@@ -118,20 +118,19 @@ fn callback(store: SCDynamicStore, changed_keys: CFArray<CFString>, context: &mu
                 name, active
             );
 
+            // We assume we know all WiFi interfaces ahead of time, and any events that
+            // aren't WiFi should be used to activate Ethernet. This is...mostly right.
+            // FIXME logic is not robust
             if context.wifis.contains(&name) && active && !context.active_ethernets.is_empty() {
                 println!("disabling wifi interface: name=\"{}\"", name);
                 set_wifi_state(&name, !active);
                 context.active_wifis.remove(&name);
-            } else if context.ethernets.contains(&name) && active {
-                println!("saw activated ethernet link, disabling all wifi links");
+            } else if !context.wifis.contains(&name) {
+                println!("disabling all wifi links");
                 for w in context.wifis.iter() {
                     println!("disabling wifi interface: name=\"{}\"", w);
                     set_wifi_state(&w, false);
                 }
-            } else if !context.wifis.contains(&name) && !context.ethernets.contains(&name) && !active {
-                // Assume it's a new Ethernet link being plugged in, add it
-                println!("new inactive ethernet link, adding to list");
-                context.ethernets.insert(name);
             }
         } else {
             println!("removed link: {}", name);
