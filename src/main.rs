@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::process::Command;
 
+use anyhow::{Context, Result};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType, ToVoid};
 use core_foundation::boolean::CFBoolean;
@@ -8,13 +9,19 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::propertylist::CFPropertyList;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_foundation::string::CFString;
+use itertools::Itertools;
 use system_configuration::dynamic_store::{
     SCDynamicStore, SCDynamicStoreBuilder, SCDynamicStoreCallBackContext,
 };
 use system_configuration::network_configuration::get_interfaces;
 use system_configuration::sys::schema_definitions::kSCPropNetLinkActive;
+use tracing::info;
+use tracing_subscriber::fmt;
 
-fn main() {
+fn main() -> Result<()> {
+    let format = fmt::format().compact();
+    tracing_subscriber::fmt().event_format(format).init();
+
     let ethernets = &mut HashSet::new();
     let wifis = &mut HashSet::new();
     let active_ethernets = &mut HashSet::new();
@@ -22,7 +29,7 @@ fn main() {
 
     let callback_context = SCDynamicStoreCallBackContext {
         callout: callback,
-        info: Context {
+        info: ContextState {
             ethernets,
             wifis,
             active_ethernets,
@@ -34,43 +41,57 @@ fn main() {
         .callback_context(callback_context)
         .build();
 
-    let ifaces = get_interfaces();
-    for iface in ifaces.iter() {
-        let if_type = iface.interface_type_string().unwrap().to_string();
-        let if_name = iface.bsd_name().unwrap().to_string();
-        let if_disp = iface.display_name().unwrap();
+    for iface in get_interfaces().iter() {
+        let r#type = iface
+            .interface_type_string()
+            .context("error getting interface type")?
+            .to_string();
+        let name = iface
+            .bsd_name()
+            .context("error getting interface bsd name")?
+            .to_string();
+        let display_name = iface
+            .display_name()
+            .context("error getting interface display name")?
+            .to_string();
 
-        let key = format!("State:/Network/Interface/{}/Link", if_name);
+        let key = format!("State:/Network/Interface/{}/Link", name);
         let key = CFString::from(key.as_str());
         let active = get_link_state(&store, key).unwrap();
 
-        println!(
-            "found interface: name=\"{}\", type=\"{}\", display_name=\"{}\", active=\"{}\"",
-            if_name, if_type, if_disp, active,
-        );
+        info!(name, r#type, active, display_name, "found interface");
 
-        if if_type == String::from("Ethernet") {
-            ethernets.insert(if_name.clone());
+        if r#type == *"Ethernet" {
+            ethernets.insert(name.clone());
             if active {
-                active_ethernets.insert(if_name);
+                active_ethernets.insert(name);
             }
-        } else if if_type == String::from("IEEE80211") {
-            wifis.insert(if_name.clone());
+        } else if r#type == *"IEEE80211" {
+            wifis.insert(name.clone());
             if active {
-                active_wifis.insert(if_name);
+                active_wifis.insert(name);
             }
         }
     }
 
-    println!("found ethernet links: {:?}", ethernets);
-    println!("found wifi links: {:?}", wifis);
-    println!("found active ethernet links: {:?}", active_ethernets);
-    println!("found active wifi links: {:?}", active_wifis);
+    info!(
+        names = ethernets.iter().join(","),
+        "found ethernet interfaces"
+    );
+    info!(names = wifis.iter().join(","), "found wifi interfaces");
+    info!(
+        names = active_ethernets.iter().join(","),
+        "active ethernet interfaces"
+    );
+    info!(
+        names = active_wifis.iter().join(","),
+        "active wifi interfaces"
+    );
 
-    if active_ethernets.len() > 0 && active_wifis.len() > 0 {
+    if !active_ethernets.is_empty() && !active_wifis.is_empty() {
         for name in active_wifis.iter() {
-            println!("disabling wifi interface: name=\"{}\"", name);
-            set_wifi_state(&name, false);
+            info!(name, "disabling wifi interface");
+            set_wifi_state(name, false);
         }
     }
 
@@ -80,21 +101,22 @@ fn main() {
         CFArray::from_CFTypes(&[CFString::from("State:/Network/Interface/(en.*)/Link")]);
 
     if store.set_notification_keys(&watch_keys, &watch_patterns) {
-        println!("registered for notifications of link state");
+        info!("registered for notifications of link state");
     } else {
-        panic!("unable to register for notifications of link state");
+        panic!("unable to register for notifications");
     }
 
     let run_loop_source = store.create_run_loop_source();
     let run_loop = CFRunLoop::get_current();
     run_loop.add_source(&run_loop_source, unsafe { kCFRunLoopCommonModes });
 
-    println!("entering run loop");
+    info!("starting run loop");
     CFRunLoop::run_current();
+
+    Ok(())
 }
 
-#[derive(Debug)]
-struct Context<'a, 'b, 'c, 'd> {
+struct ContextState<'a, 'b, 'c, 'd> {
     ethernets: &'a mut HashSet<String>,
     wifis: &'b mut HashSet<String>,
     active_ethernets: &'c mut HashSet<String>,
@@ -102,7 +124,7 @@ struct Context<'a, 'b, 'c, 'd> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn callback(store: SCDynamicStore, changed_keys: CFArray<CFString>, context: &mut Context) {
+fn callback(store: SCDynamicStore, changed_keys: CFArray<CFString>, context: &mut ContextState) {
     for key in changed_keys.iter() {
         let name = key
             .clone()
@@ -113,35 +135,32 @@ fn callback(store: SCDynamicStore, changed_keys: CFArray<CFString>, context: &mu
             .unwrap()
             .to_string();
         if let Some(active) = get_link_state(&store, key.clone()) {
-            println!(
-                "link state changed: name=\"{}\", active=\"{}\"",
-                name, active
-            );
+            info!(name, active, "interface link state changed");
 
             // We assume we know all WiFi interfaces ahead of time, and any events that
             // aren't WiFi should be used to activate Ethernet. This is...mostly right.
             // FIXME logic is not robust
             if context.wifis.contains(&name) && active && !context.active_ethernets.is_empty() {
-                println!("disabling wifi interface: name=\"{}\"", name);
+                info!(name, "disabling wifi interface");
                 set_wifi_state(&name, !active);
                 context.active_wifis.remove(&name);
             } else if !context.wifis.contains(&name) {
-                println!("disabling all wifi links");
+                info!("disabling all wifi interfaces");
                 for w in context.wifis.iter() {
-                    println!("disabling wifi interface: name=\"{}\"", w);
-                    set_wifi_state(&w, false);
+                    info!(name = w, "disabling wifi interface");
+                    set_wifi_state(w, false);
                 }
             }
         } else {
-            println!("removed link: {}", name);
+            info!(name, "interface was removed");
             context.active_wifis.remove(&name);
             context.active_ethernets.remove(&name);
 
             if context.active_ethernets.is_empty() {
-                println!("no active ethernet links, enabling any wifi links");
+                info!("no active ethernet interfaces, enabling any wifi interfaces");
                 for w in context.wifis.iter() {
-                    println!("enabling wifi interface: name=\"{}\"", w);
-                    set_wifi_state(&w, true);
+                    info!(name = w, "enabling wifi interface");
+                    set_wifi_state(w, true);
                 }
             }
         }
