@@ -4,5 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.59"
 core-foundation = "0.9.3"
+itertools = "0.10.3"
 system-configuration = "0.5.0"
+tracing = "0.1.36"
+tracing-subscriber = "0.3.15"
